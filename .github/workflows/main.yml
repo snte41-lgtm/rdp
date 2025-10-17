@@ -1,4 +1,4 @@
-name: RDP (No Password, Tailscale) - full workflow
+name: RDP (No Password, Tailscale) - full workflow (fixed net user)
 
 on:
   workflow_dispatch:
@@ -15,7 +15,7 @@ jobs:
     env:
       RDP_USER: RDP
     steps:
-      - name: Checkout (no-op, kept for consistency)
+      - name: Checkout (no-op)
         uses: actions/checkout@v4
 
       - name: Configure Core RDP Settings & Allow Blank Passwords
@@ -25,7 +25,7 @@ jobs:
           # Enable Remote Desktop connections
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                              -Name "fDenyTSConnections" -Value 0 -Force
-          # Disable Network Level Authentication (if you need looser auth)
+          # Disable Network Level Authentication (looser auth, required here)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
@@ -36,7 +36,7 @@ jobs:
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389 | Out-Null
 
-          # Allow blank password for network logons (0 = allow blank password over network)
+          # Allow blank password for network logons (0 = allow)
           New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "LimitBlankPasswordUse" -PropertyType DWord -Value 0 -Force | Out-Null
           Write-Host "Set LimitBlankPasswordUse = 0"
 
@@ -45,23 +45,28 @@ jobs:
           Start-Sleep -Seconds 3
           Write-Host "RDP configured."
 
-      - name: Create RDP User With No Password (robust)
+      - name: Create RDP User With No Password (robust, fixed)
         shell: powershell
         run: |
           $username = $env:RDP_USER
           Write-Host "=== Creating or updating user '$username' with blank password ==="
 
-          function Run-NetCmd($args) {
-              $out = & net.exe $args 2>&1
+          function Run-NetUserCmd($cmd) {
+              # Use cmd /c to run net user safely and capture output
+              $full = "cmd /c `"$cmd`""
+              $out = & cmd /c $cmd 2>&1
               $rc = $LASTEXITCODE
               return @{ rc = $rc; out = $out -join "`n" }
           }
 
           if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
               Write-Host "User $username already exists. Attempting to set blank password via 'net user'."
-              $res = Run-NetCmd("$username """)
+              $res = Run-NetUserCmd("net user $username \"\"")
               if ($res.rc -ne 0) {
                   Write-Host "Warning: Could not set blank password with net user. Message:`n$res.out"
+                  # Try reset via net user /active:yes to ensure account enabled
+                  $r2 = Run-NetUserCmd("net user $username /active:yes")
+                  Write-Host "Attempted to ensure account active. rc=$($r2.rc)"
               } else {
                   Write-Host "Blank password applied to existing user."
               }
@@ -72,7 +77,7 @@ jobs:
                   Write-Host "Created user with New-LocalUser -NoPassword"
               } catch {
                   Write-Host "New-LocalUser -NoPassword not supported or failed. Falling back to 'net user' to create blank-password user."
-                  $resAdd = Run-NetCmd("$username "" /add")
+                  $resAdd = Run-NetUserCmd("net user $username \"\" /add")
                   if ($resAdd.rc -ne 0) {
                       Write-Error "Failed to create user with blank password. net user output:`n$resAdd.out"
                       exit 1
@@ -89,8 +94,8 @@ jobs:
               Write-Host "Added $username to local groups (PowerShell cmdlets) or already a member."
           } catch {
               Write-Host "PowerShell Add-LocalGroupMember failed; using net localgroup fallback."
-              $r1 = Run-NetCmd('"Remote Desktop Users" ' + $username + ' /add')
-              $r2 = Run-NetCmd('Users ' + $username + ' /add')
+              $r1 = Run-NetUserCmd("net localgroup \"Remote Desktop Users\" $username /add")
+              $r2 = Run-NetUserCmd("net localgroup Users $username /add")
               if ($r1.rc -ne 0) { Write-Host "net localgroup (RDP users) message:`n$r1.out" }
               if ($r2.rc -ne 0) { Write-Host "net localgroup (Users) message:`n$r2.out" }
           }
@@ -205,7 +210,7 @@ jobs:
               }
           } catch {
               Write-Host "Remove-LocalUser failed or not supported; trying 'net user $username /delete'."
-              & net user $username /delete 2>&1 | Write-Host
+              & cmd /c "net user $username /delete" 2>&1 | Write-Host
           }
 
           # Restore LimitBlankPasswordUse = 1 (disallow blank password over network)
@@ -217,4 +222,3 @@ jobs:
           Write-Host "Deleted firewall rule RDP-Tailscale (if existed)."
 
           Write-Host "Cleanup complete."
-
