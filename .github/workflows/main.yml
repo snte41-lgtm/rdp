@@ -1,224 +1,107 @@
-name: RDP (No Password, Tailscale) - full workflow (fixed net user)
+name: RDP
 
 on:
   workflow_dispatch:
-    inputs:
-      duration_minutes:
-        description: 'Berapa menit koneksi RDP harus aktif sebelum cleanup (default 60)'
-        required: false
-        default: '60'
 
 jobs:
-  setup-and-run-rdp:
+  secure-rdp:
     runs-on: windows-latest
     timeout-minutes: 3600
-    env:
-      RDP_USER: RDP
-    steps:
-      - name: Checkout (no-op)
-        uses: actions/checkout@v4
 
-      - name: Configure Core RDP Settings & Allow Blank Passwords
-        shell: powershell
+    steps:
+      - name: Configure Core RDP Settings
         run: |
-          Write-Host "=== Configure RDP & allow blank password ==="
-          # Enable Remote Desktop connections
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                              -Name "fDenyTSConnections" -Value 0 -Force
-          # Disable Network Level Authentication (looser auth, required here)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force
 
-          # Firewall rule for RDP (avoid duplicate)
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # Allow incoming connections on port 3389
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389 | Out-Null
+            dir=in action=allow protocol=TCP localport=3389
 
-          # Allow blank password for network logons (0 = allow)
-          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "LimitBlankPasswordUse" -PropertyType DWord -Value 0 -Force | Out-Null
-          Write-Host "Set LimitBlankPasswordUse = 0"
-
-          # Restart Remote Desktop service
+          # Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
-          Start-Sleep -Seconds 3
-          Write-Host "RDP configured."
 
-      - name: Create RDP User With No Password (robust, fixed)
-        shell: powershell
+      - name: Create RDP User with Fixed Secure Password
         run: |
-          $username = $env:RDP_USER
-          Write-Host "=== Creating or updating user '$username' with blank password ==="
+          # Fixed password (contains upper, lower, number, special)
+          $password = 'Amirul10021996'
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
-          function Run-NetUserCmd($cmd) {
-              # Use cmd /c to run net user safely and capture output
-              $full = "cmd /c `"$cmd`""
-              $out = & cmd /c $cmd 2>&1
-              $rc = $LASTEXITCODE
-              return @{ rc = $rc; out = $out -join "`n" }
-          }
-
-          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
-              Write-Host "User $username already exists. Attempting to set blank password via 'net user'."
-              $res = Run-NetUserCmd("net user $username \"\"")
-              if ($res.rc -ne 0) {
-                  Write-Host "Warning: Could not set blank password with net user. Message:`n$res.out"
-                  # Try reset via net user /active:yes to ensure account enabled
-                  $r2 = Run-NetUserCmd("net user $username /active:yes")
-                  Write-Host "Attempted to ensure account active. rc=$($r2.rc)"
-              } else {
-                  Write-Host "Blank password applied to existing user."
-              }
+          # Create or update local user "RDP"
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
           } else {
-              try {
-                  Write-Host "Trying New-LocalUser -NoPassword..."
-                  New-LocalUser -Name $username -NoPassword -AccountNeverExpires -PasswordNeverExpires -ErrorAction Stop
-                  Write-Host "Created user with New-LocalUser -NoPassword"
-              } catch {
-                  Write-Host "New-LocalUser -NoPassword not supported or failed. Falling back to 'net user' to create blank-password user."
-                  $resAdd = Run-NetUserCmd("net user $username \"\" /add")
-                  if ($resAdd.rc -ne 0) {
-                      Write-Error "Failed to create user with blank password. net user output:`n$resAdd.out"
-                      exit 1
-                  } else {
-                      Write-Host "User created via 'net user' with blank password."
-                  }
-              }
+              # reset password if user exists
+              Set-LocalUser -Name "RDP" -Password $securePass
           }
 
-          # Add to groups (Remote Desktop Users and Users)
-          try {
-              Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
-              Add-LocalGroupMember -Group "Users" -Member $username -ErrorAction SilentlyContinue
-              Write-Host "Added $username to local groups (PowerShell cmdlets) or already a member."
-          } catch {
-              Write-Host "PowerShell Add-LocalGroupMember failed; using net localgroup fallback."
-              $r1 = Run-NetUserCmd("net localgroup \"Remote Desktop Users\" $username /add")
-              $r2 = Run-NetUserCmd("net localgroup Users $username /add")
-              if ($r1.rc -ne 0) { Write-Host "net localgroup (RDP users) message:`n$r1.out" }
-              if ($r2.rc -ne 0) { Write-Host "net localgroup (Users) message:`n$r2.out" }
-          }
+          # Add to groups (silently continue if already member)
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
 
-          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
-              Write-Error "User creation/verification failed. Aborting."
+          # Export credentials to GitHub environment
+          "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
               exit 1
-          } else {
-              Write-Host "User $username ready (password blank or unset)."
           }
 
       - name: Install Tailscale
-        shell: powershell
         run: |
-          Write-Host "=== Installing Tailscale ==="
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
+          
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
-          Write-Host "Tailscale installer finished."
 
       - name: Establish Tailscale Connection
-        shell: powershell
-        env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          if (-not $env:TAILSCALE_AUTH_KEY) {
-              Write-Error "secrets.TAILSCALE_AUTH_KEY is not set. Cannot bring Tailscale up."
-              exit 1
-          }
-          $exe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
-          if (-not (Test-Path $exe)) {
-              Write-Error "tailscale.exe not found at $exe"
-              exit 1
-          }
-
-          Write-Host "Bringing up Tailscale (headless)..."
-          & $exe up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID
-
-          # wait for IPv4 assignment
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          # Wait for Tailscale to assign an IP
           $tsIP = $null
           $retries = 0
-          while (-not $tsIP -and $retries -lt 20) {
-              try { $tsIP = & $exe ip -4 } catch { $tsIP = $null }
-              if ($tsIP) { $tsIP = $tsIP.Trim() }
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
               Start-Sleep -Seconds 5
               $retries++
           }
-
+          
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned after retries."
+              Write-Error "Tailscale IP not assigned. Exiting."
               exit 1
           }
-
-          Write-Host "Assigned Tailscale IP: $tsIP"
           "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-
+      
       - name: Verify RDP Accessibility
-        shell: powershell
         run: |
-          $ip = $env:TAILSCALE_IP
-          Write-Host "Testing TCP connectivity to $ip:3389"
-          $testResult = Test-NetConnection -ComputerName $ip -Port 3389 -WarningAction SilentlyContinue
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
           if (-not $testResult.TcpTestSucceeded) {
-              Write-Host "Warning: TCP test to RDP port failed. You may still be able to connect if firewall/policy differs."
-          } else {
-              Write-Host "TCP connectivity to RDP port successful."
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
           }
+          Write-Host "TCP connectivity successful!"
 
-      - name: Show RDP Access Info & Keep Alive
-        shell: powershell
-        env:
-          DURATION_MINUTES: ${{ github.event.inputs.duration_minutes || '60' }}
+      - name: Maintain Connection
         run: |
-          $ip = $env:TAILSCALE_IP
-          $user = $env:RDP_USER
-          $duration = [int]$env:DURATION_MINUTES
-          Write-Host "`n=== RDP ACCESS INFO ==="
-          Write-Host "Address (Tailscale): $ip"
-          Write-Host "Username: $user"
-          Write-Host "Password: (blank / no password)"
-          Write-Host "RDP will remain available for $duration minutes, then cleanup will run."
-          Write-Host "========================`n"
-
-          # Keep the job alive for the requested duration so runner doesn't exit before cleanup
-          $elapsed = 0
-          while ($elapsed -lt ($duration * 60)) {
-              Write-Host "[$(Get-Date -Format o)] RDP active; elapsed $elapsed sec / $($duration*60) sec"
-              Start-Sleep -Seconds 30
-              $elapsed += 30
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: Amirul10021996"
+          Write-Host "==================`n"
+          
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
           }
-
-      - name: Trigger Cleanup (continuation in same job)
-        shell: powershell
-        run: |
-          Write-Host "Duration expired; proceeding to cleanup in next step."
-
-      - name: Cleanup - remove user and restore Lsa policy
-        shell: powershell
-        run: |
-          $username = $env:RDP_USER
-          Write-Host "=== Cleanup: removing user and restoring LSA settings ==="
-
-          # Remove user (try Remove-LocalUser then fallback to net user /delete)
-          try {
-              if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
-                  Remove-LocalUser -Name $username -ErrorAction Stop
-                  Write-Host "Removed local user $username (Remove-LocalUser)."
-              } else {
-                  Write-Host "User $username not present; nothing to remove via Remove-LocalUser."
-              }
-          } catch {
-              Write-Host "Remove-LocalUser failed or not supported; trying 'net user $username /delete'."
-              & cmd /c "net user $username /delete" 2>&1 | Write-Host
-          }
-
-          # Restore LimitBlankPasswordUse = 1 (disallow blank password over network)
-          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "LimitBlankPasswordUse" -PropertyType DWord -Value 1 -Force | Out-Null
-          Write-Host "Restored LimitBlankPasswordUse = 1"
-
-          # Remove RDP firewall rule (optional)
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
-          Write-Host "Deleted firewall rule RDP-Tailscale (if existed)."
-
-          Write-Host "Cleanup complete."
