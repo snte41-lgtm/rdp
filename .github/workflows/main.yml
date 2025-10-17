@@ -1,0 +1,119 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Allow incoming connections on port 3389
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # Ensure Windows allows blank password use over network:
+          # HKLM\SYSTEM\CurrentControlSet\Control\Lsa\LimitBlankPasswordUse = 0
+          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "LimitBlankPasswordUse" -PropertyType DWord -Value 0 -Force | Out-Null
+
+          # Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User With No Password
+        run: |
+          # Attempt to create user with -NoPassword (if supported), otherwise try empty SecureString
+          $username = "RDP"
+          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
+              Write-Host "User $username already exists — attempting to set to no-password state."
+              try {
+                  # Try to remove password by using Set-LocalUser with an empty secure string (may fail on some platforms)
+                  $empty = ConvertTo-SecureString "" -AsPlainText -Force
+                  Set-LocalUser -Name $username -Password $empty -ErrorAction SilentlyContinue
+              } catch {
+                  Write-Host "Could not reset password for existing user; continuing."
+              }
+          } else {
+              try {
+                  # Preferred: create user with no password if PowerShell supports -NoPassword
+                  New-LocalUser -Name $username -NoPassword -AccountNeverExpires -PasswordNeverExpires -ErrorAction Stop
+              } catch {
+                  Write-Host "New-LocalUser -NoPassword not supported or failed, trying with empty SecureString..."
+                  $empty = ConvertTo-SecureString "" -AsPlainText -Force
+                  New-LocalUser -Name $username -Password $empty -AccountNeverExpires -PasswordNeverExpires -ErrorAction Stop
+              }
+          }
+
+          # Add to groups
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Users" -Member $username -ErrorAction SilentlyContinue
+
+          # Verify user exists
+          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
+              Write-Error "User creation failed"
+              exit 1
+          } else {
+              Write-Host "User $username created/updated (no password)."
+          }
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Maintain Connection (display connection info)
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: (empty / no password)"
+          Write-Host "==================`n"
+          
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
